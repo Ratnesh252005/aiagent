@@ -6,10 +6,14 @@ A powerful Retrieval Augmented Generation (RAG) system that allows users to uplo
 
 - **📄 PDF Processing**: Upload and automatically extract text from PDF documents
 - **🔪 Smart Chunking**: Intelligent document segmentation with overlap for better context
-- **📊 Progress Tracking**: Real-time progress bars showing document processing status
+- **📊 Progress Tracking**: Real-time progress bars and status steps
+  - Visual indicators during Q&A: "Analyzing query…" → "Retrieving context…" → "Generating answer…"
 - **🧠 Semantic Search**: Hugging Face embeddings for accurate content retrieval
 - **🗄️ Vector Storage**: Pinecone vector database for efficient similarity search
 - **🤖 AI Responses**: Google Gemini 1.5 Flash API for fast, cost-effective answer generation
+- **🧭 Query Understanding Agent (LangGraph)**: Classifies intent (Explain/Quiz/Summary) and optionally decomposes complex questions into sub-questions
+- **🧪 Hybrid Re-ranking**: Combines vector similarity with lexical matching (RapidFuzz) for better retrieval precision
+- **📂 Document Management**: Sidebar document selector and one-click delete of a selected document
 - **💬 Interactive UI**: Beautiful Streamlit web interface with chat history
 - **📈 Analytics**: Document statistics and source attribution
 
@@ -72,6 +76,11 @@ pip install pinecone
 **Install remaining packages:**
 ```bash
 pip install numpy pandas
+```
+
+**Install new agent & re-ranking dependencies:**
+```bash
+pip install langgraph langchain-core rapidfuzz
 ```
 
 **Method 3: Install from Requirements File**
@@ -208,7 +217,11 @@ Generating embeddings: 15/15
 ### 3. Ask Questions
 1. **Type your question** in the "Ask a question about your document" field
 2. **Click "Get Answer"** button
-3. **Wait for processing** (usually 2-5 seconds with Gemini 1.5 Flash)
+3. **Watch status steps** in the app:
+   - Analyzing query… (Query Understanding Agent via LangGraph)
+   - Retrieving context… (Hybrid retrieval + re-ranking)
+   - Generating answer… (Gemini 1.5 Flash)
+4. **Get the answer** with cited chunks and diagnostics
 
 **Example Questions:**
 - "What is the main topic of this document?"
@@ -245,6 +258,18 @@ Generating embeddings: 15/15
          └─────────────▶│   LLM Response   │◀───────────┘
                         │ (Gemini 1.5 Flash)│
                         └──────────────────┘
+
+### Query Understanding Agent (LangGraph)
+
+- Classifies intent: `explain`, `quiz`, `summary`, `other`
+- Optionally decomposes complex questions into 2–5 sub-questions
+- We retrieve per sub-question, merge results, and re-rank before answering
+
+### Hybrid Re-ranking
+
+- Vector score (Pinecone cosine similarity) blended with lexical score (RapidFuzz token set ratio)
+- Default weights: `final = 0.7 * vector + 0.3 * lexical`
+- See "🔎 Retrieval diagnostics" expander for per-chunk scores
 ```
 
 ## 🛠️ Troubleshooting
@@ -291,7 +316,17 @@ pip install pinecone
 ```
 Rate limit reached. Waiting 2 seconds before retry...
 ```
-**Solution:** Wait for automatic retry or upgrade Gemini API quota
+**What it means:** Gemini has throttled or your quota is temporarily exhausted.
+
+**What we do:**
+- The Query Understanding Agent and Answer generation both use automatic retry with exponential backoff.
+- If the agent still cannot proceed, it falls back to a default intent (explain) with no decomposition and continues.
+
+**Solutions:**
+- Wait a few seconds and try again
+- Use Gemini 1.5 Flash (already set) instead of Pro
+- Check quotas in Google AI Studio and upgrade if needed
+- Optionally generate a new API key under a different project/account and update `.env`
 
 #### 2. **Chunking Issues**
 ```
@@ -339,6 +374,8 @@ rag-document-assistant/
 ├── 📄 embeddings.py             # Hugging Face embedding generation
 ├── 📄 vector_store.py           # Pinecone vector database interface
 ├── 📄 llm_client.py            # Gemini API client
+├── 📁 agents/                  # Agents package (LangGraph)
+│   └── query_understanding.py  # Query Understanding Agent (intent + decomposition)
 ├── 📄 requirements.txt          # Python dependencies (full)
 ├── 📄 requirements_minimal.txt  # Python dependencies (minimal)
 ├── 📄 .env.example             # Environment variables template

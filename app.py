@@ -5,7 +5,9 @@ from pdf_processor import PDFProcessor
 from embeddings import EmbeddingGenerator
 from vector_store import PineconeVectorStore
 from llm_client import GeminiLLMClient
+from agents.query_understanding import QueryUnderstandingAgent
 import uuid
+from rapidfuzz import fuzz
 
 # Load environment variables
 load_dotenv()
@@ -60,6 +62,8 @@ def initialize_session_state():
         st.session_state.current_document_id = None
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
+    if 'documents' not in st.session_state:
+        st.session_state.documents = []
 
 def check_api_keys():
     """Check if all required API keys are available"""
@@ -84,6 +88,7 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
     embedding_generator = EmbeddingGenerator(model_name="all-MiniLM-L6-v2")
     vector_store = PineconeVectorStore(pinecone_key, pinecone_env)
     llm_client = GeminiLLMClient(gemini_key)
+    query_agent = QueryUnderstandingAgent(gemini_key, model_name="gemini-1.5-flash")
     
     # Test connections
     connections_ok = True
@@ -102,7 +107,7 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
         if not vector_store.create_index(embedding_dim):
             connections_ok = False
     
-    return pdf_processor, embedding_generator, vector_store, llm_client, connections_ok
+    return pdf_processor, embedding_generator, vector_store, llm_client, query_agent, connections_ok
 
 def main():
     """Main application function"""
@@ -124,7 +129,7 @@ def main():
     
     # Initialize components
     with st.spinner("Initializing RAG components..."):
-        pdf_processor, embedding_generator, vector_store, llm_client, connections_ok = initialize_components(
+        pdf_processor, embedding_generator, vector_store, llm_client, query_agent, connections_ok = initialize_components(
             pinecone_key, pinecone_env, gemini_key
         )
     
@@ -154,13 +159,42 @@ def main():
                     if embedded_chunks:
                         # Upload to Pinecone
                         document_id = str(uuid.uuid4())
-                        success = vector_store.upsert_embeddings(embedded_chunks, document_id)
+                        document_name = getattr(uploaded_file, 'name', 'Uploaded Document')
+                        success = vector_store.upsert_embeddings(embedded_chunks, document_id, document_name=document_name)
                         
                         if success:
                             st.session_state.pdf_processed = True
                             st.session_state.embeddings_uploaded = True
                             st.session_state.current_document_id = document_id
                             st.rerun()
+
+        # Document selector and management
+        if st.session_state.get('documents'):
+            st.markdown('<h2 class="section-header">📂 Documents</h2>', unsafe_allow_html=True)
+            doc_labels = [f"{d['name']} ({d['id'][:8]}...)" for d in st.session_state.documents]
+            # Determine current selection index
+            current_idx = 0
+            for i, d in enumerate(st.session_state.documents):
+                if d['id'] == st.session_state.get('current_document_id'):
+                    current_idx = i
+                    break
+            selected_idx = st.selectbox("Select document", list(range(len(doc_labels))), format_func=lambda i: doc_labels[i], index=current_idx)
+            selected_doc = st.session_state.documents[selected_idx]
+            st.session_state.current_document_id = selected_doc['id']
+
+            # Delete document button
+            if st.button("Delete Selected Document", type="secondary"):
+                if vector_store.delete_document(selected_doc['id']):
+                    # Remove from session list
+                    st.session_state.documents = [d for d in st.session_state.documents if d['id'] != selected_doc['id']]
+                    # Reset current selection
+                    if st.session_state.documents:
+                        st.session_state.current_document_id = st.session_state.documents[0]['id']
+                    else:
+                        st.session_state.current_document_id = None
+                        st.session_state.pdf_processed = False
+                    st.success("Document deleted.")
+                    st.rerun()
         
         # Display processing status
         if st.session_state.pdf_processed:
@@ -198,30 +232,85 @@ def main():
             
             if st.button("Get Answer", type="primary") and query:
                 if st.session_state.current_document_id:
-                    # Generate query embedding
-                    query_embedding = embedding_generator.generate_single_embedding(query)
-                    
-                    if query_embedding.size > 0:
-                        # Search for similar chunks
-                        with st.spinner("🔍 Searching for relevant information..."):
-                            similar_chunks = vector_store.search_similar(
-                                query_embedding, 
+                    status_box = st.status("Processing query...", state="running", expanded=True)
+                    try:
+                        # Step 1: Analyzing query
+                        status_box.update(label="Analyzing query…", state="running")
+                        qa_analysis = query_agent.analyze_query(query)
+                        with st.expander("🧭 Query understanding"):
+                            st.write(qa_analysis)
+
+                        # Decide which questions to retrieve on
+                        questions_for_retrieval = qa_analysis.get("sub_questions") or [query]
+
+                        # Step 2: Retrieving context
+                        status_box.update(label="Retrieving context…", state="running")
+                        aggregated = []
+                        seen_ids = set()
+                        for q in questions_for_retrieval:
+                            q_embed = embedding_generator.generate_single_embedding(q)
+                            if q_embed.size == 0:
+                                continue
+                            results = vector_store.search_similar(
+                                q_embed,
                                 top_k=search_k,
                                 document_id=st.session_state.current_document_id
                             )
-                        
-                        if similar_chunks:
-                            # Generate answer
-                            result = llm_client.answer_question(query, similar_chunks)
-                            
-                            # Add to chat history
-                            st.session_state.chat_history.append({
-                                "query": query,
-                                "answer": result["answer"],
-                                "sources": result["sources"]
-                            })
-                            
-                            st.rerun()
+                            for r in results:
+                                if r.get('id') not in seen_ids:
+                                    seen_ids.add(r.get('id'))
+                                    item = r.copy()
+                                    item['matched_query'] = q
+                                    aggregated.append(item)
+
+                        similar_chunks = aggregated
+                        if not similar_chunks:
+                            status_box.update(label="No relevant context found.", state="error")
+                            st.warning("Could not find relevant passages for your question.")
+                            return
+
+                        # Re-ranking
+                        reranked = []
+                        for ch in similar_chunks:
+                            vec_score = ch.get('score', 0.0)
+                            base_q = ch.get('matched_query') or query
+                            lex_score = fuzz.token_set_ratio(base_q, ch.get('text', '')) / 100.0
+                            final_score = 0.7 * vec_score + 0.3 * lex_score
+                            item = ch.copy()
+                            item['final_score'] = final_score
+                            item['lex_score'] = lex_score
+                            item['base_query'] = base_q
+                            reranked.append(item)
+                        reranked.sort(key=lambda x: x['final_score'], reverse=True)
+                        top_context = reranked[:search_k]
+
+                        with st.expander("🔎 Retrieval diagnostics (top matches)"):
+                            for idx, it in enumerate(top_context, start=1):
+                                st.markdown(
+                                    f"**{idx}. Chunk {it.get('chunk_number', '?')}** — "
+                                    f"vec: {it.get('score', 0.0):.3f}, "
+                                    f"lex: {it.get('lex_score', 0.0):.3f}, "
+                                    f"final: {it.get('final_score', 0.0):.3f}\n"
+                                    f"Matched query: {it.get('base_query', query)}"
+                                )
+                                st.write((it.get('text', '')[:300] + '...') if len(it.get('text', '')) > 300 else it.get('text', ''))
+
+                        # Step 3: Generating answer
+                        status_box.update(label="Generating answer…", state="running")
+                        result = llm_client.answer_question(query, top_context)
+
+                        # Done
+                        status_box.update(label="Done ✅", state="complete")
+
+                        # Add to chat history
+                        st.session_state.chat_history.append({
+                            "query": query,
+                            "answer": result["answer"],
+                            "sources": result["sources"]
+                        })
+                        st.rerun()
+                    except Exception as e:
+                        status_box.update(label=f"Error: {e}", state="error")
             
             # Display chat history
             if st.session_state.chat_history:

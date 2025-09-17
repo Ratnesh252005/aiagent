@@ -4,3 +4,6 @@ google-generativeai
 sentence-transformers
 PyPDF2
 python-dotenv
+rapidfuzz
+langgraph
+langchain-core

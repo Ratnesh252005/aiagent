@@ -73,7 +73,8 @@ class PineconeVectorStore:
             return False
     
     def upsert_embeddings(self, embedded_chunks: List[Tuple[np.ndarray, str, int]], 
-                         document_id: str = None) -> bool:
+                         document_id: str = None,
+                         document_name: str = None) -> bool:
         """
         Upload embeddings to Pinecone
         
@@ -112,6 +113,7 @@ class PineconeVectorStore:
                     "text": text[:1000],  # Limit text size for metadata
                     "chunk_number": chunk_num,
                     "document_id": document_id,
+                    "document_name": document_name or "Untitled Document",
                     "timestamp": datetime.now().isoformat(),
                     "text_length": len(text)
                 }
@@ -149,10 +151,17 @@ class PineconeVectorStore:
             
             st.success(f"✅ Successfully uploaded {len(vectors)} embeddings to Pinecone")
             
-            # Store document ID in session state for later use
-            if 'document_ids' not in st.session_state:
-                st.session_state.document_ids = []
-            st.session_state.document_ids.append(document_id)
+            # Store document registry in session state for later use
+            if 'documents' not in st.session_state:
+                st.session_state.documents = []
+            # Avoid duplicates
+            if not any(d.get('id') == document_id for d in st.session_state.documents):
+                st.session_state.documents.append({
+                    'id': document_id,
+                    'name': document_name or 'Untitled Document',
+                    'vector_count': len(vectors),
+                    'created_at': datetime.now().isoformat()
+                })
             st.session_state.current_document_id = document_id
             
             return True
