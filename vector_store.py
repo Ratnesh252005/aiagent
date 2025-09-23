@@ -34,6 +34,21 @@ class PineconeVectorStore:
         except Exception as e:
             st.error(f"Error connecting to Pinecone: {str(e)}")
             return False
+
+    def _ensure_index_connected(self) -> bool:
+        """Ensure self.index is connected; attempt lazy connection if possible."""
+        if self.index is not None:
+            return True
+        if self.pc is None:
+            st.error("Pinecone client not initialized. Please check API key and restart.")
+            return False
+        try:
+            # Try to connect to existing index without creating
+            self.index = self.pc.Index(self.index_name)
+            return True
+        except Exception as e:
+            st.error(f"Pinecone index not initialized or not found: {self.index_name}. Process a document first to create it. Details: {str(e)}")
+            return False
     
     def create_index(self, dimension: int, metric: str = "cosine"):
         """
@@ -85,8 +100,7 @@ class PineconeVectorStore:
         Returns:
             Success status
         """
-        if not self.index:
-            st.error("Pinecone index not initialized")
+        if not self._ensure_index_connected():
             return False
         
         if not embedded_chunks:
@@ -183,8 +197,7 @@ class PineconeVectorStore:
         Returns:
             List of similar chunks with metadata
         """
-        if not self.index:
-            st.error("Pinecone index not initialized")
+        if not self._ensure_index_connected():
             return []
         
         try:
@@ -225,7 +238,7 @@ class PineconeVectorStore:
     
     def get_index_stats(self) -> Dict[str, Any]:
         """Get statistics about the Pinecone index"""
-        if not self.index:
+        if not self._ensure_index_connected():
             return {}
         
         try:

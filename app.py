@@ -7,6 +7,7 @@ from vector_store import PineconeVectorStore
 from llm_client import GeminiLLMClient
 from agents.query_understanding import QueryUnderstandingAgent
 from agents.reasoning_planner import ReasoningPlannerAgent
+from agents.retriever import RetrieverAgent
 import uuid
 from rapidfuzz import fuzz
 
@@ -90,7 +91,8 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
     vector_store = PineconeVectorStore(pinecone_key, pinecone_env)
     llm_client = GeminiLLMClient(gemini_key)
     query_agent = QueryUnderstandingAgent(gemini_key, model_name="gemini-1.5-flash")
-    reasoning_agent = ReasoningPlannerAgent(gemini_key, model_name="gemini-1.5-flash")
+    retriever_agent = RetrieverAgent(embedding_generator, vector_store)
+    reasoning_agent = ReasoningPlannerAgent(gemini_key, model_name="gemini-1.5-flash", retriever_agent=retriever_agent)
     
     # Test connections
     connections_ok = True
@@ -103,12 +105,6 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
     if not llm_client.initialize_gemini():
         connections_ok = False
     
-    # Create Pinecone index
-    if connections_ok:
-        embedding_dim = embedding_generator.get_embedding_dimension()
-        if not vector_store.create_index(embedding_dim):
-            connections_ok = False
-    
     return {
         'pdf_processor': pdf_processor,
         'embedding_generator': embedding_generator,
@@ -116,6 +112,7 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
         'llm_client': llm_client,
         'query_agent': query_agent,
         'reasoning_agent': reasoning_agent,
+        'retriever_agent': retriever_agent,
         'connections_ok': connections_ok
     }
 
@@ -146,6 +143,7 @@ def main():
         llm_client = components['llm_client']
         query_agent = components['query_agent']
         reasoning_agent = components['reasoning_agent']
+        retriever_agent = components['retriever_agent']
         connections_ok = components['connections_ok']
     
     if not connections_ok:
@@ -175,6 +173,9 @@ def main():
                         # Upload to Pinecone
                         document_id = str(uuid.uuid4())
                         document_name = getattr(uploaded_file, 'name', 'Uploaded Document')
+                        # Ensure index exists JIT (deferred from startup for faster load)
+                        embedding_dim = embedding_generator.get_embedding_dimension()
+                        vector_store.create_index(embedding_dim)
                         success = vector_store.upsert_embeddings(embedded_chunks, document_id, document_name=document_name)
                         
                         if success:
@@ -224,6 +225,7 @@ def main():
         st.markdown('<h2 class="section-header">⚙️ Settings</h2>', unsafe_allow_html=True)
         
         search_k = st.slider("Number of relevant chunks to retrieve", 1, 10, 5)
+        force_reasoning = st.toggle("Force reasoning mode", value=False, help="For testing: always trigger reasoning chain display.")
         
         if st.button("Clear Chat History"):
             st.session_state.chat_history = []
@@ -258,46 +260,38 @@ def main():
                         # Decide which questions to retrieve on
                         questions_for_retrieval = qa_analysis.get("sub_questions") or [query]
 
-                        # Step 2: Retrieving context
-                        status_box.update(label="Retrieving context…", state="running")
-                        aggregated = []
-                        seen_ids = set()
-                        for q in questions_for_retrieval:
-                            q_embed = embedding_generator.generate_single_embedding(q)
-                            if q_embed.size == 0:
-                                continue
-                            results = vector_store.search_similar(
-                                q_embed,
-                                top_k=search_k,
-                                document_id=st.session_state.current_document_id
-                            )
-                            for r in results:
-                                if r.get('id') not in seen_ids:
-                                    seen_ids.add(r.get('id'))
-                                    item = r.copy()
-                                    item['matched_query'] = q
-                                    aggregated.append(item)
-
-                        similar_chunks = aggregated
-                        if not similar_chunks:
+                        # Step 2: Let planner execute retrieval
+                        status_box.update(label="Planning & retrieving…", state="running")
+                        # Ensure index exists/connected in case this is a fresh session
+                        try:
+                            embedding_dim = embedding_generator.get_embedding_dimension()
+                            vector_store.create_index(embedding_dim)
+                        except Exception:
+                            pass
+                        reasoning_context = {
+                            "query": query,
+                            "sub_questions": questions_for_retrieval,
+                            "intent": qa_analysis.get("intent", "unknown"),
+                            "document_id": st.session_state.current_document_id,
+                            "top_k": search_k,
+                            "force_reasoning": force_reasoning,
+                        }
+                        reasoning_result = reasoning_agent.process_query(query, reasoning_context)
+                        top_context = reasoning_result.get("context", {}).get("retrieved_chunks", [])
+                        if not top_context:
                             status_box.update(label="No relevant context found.", state="error")
                             st.warning("Could not find relevant passages for your question.")
+                            # Record explicit chat entry indicating no context
+                            chat_entry = {
+                                "query": query,
+                                "answer": "No relevant context was found in the uploaded document for your question.",
+                                "sources": [],
+                                "reasoning_required": False,
+                                "reasoning_chain": []
+                            }
+                            st.session_state.chat_history.append(chat_entry)
+                            st.rerun()
                             return
-
-                        # Re-ranking
-                        reranked = []
-                        for ch in similar_chunks:
-                            vec_score = ch.get('score', 0.0)
-                            base_q = ch.get('matched_query') or query
-                            lex_score = fuzz.token_set_ratio(base_q, ch.get('text', '')) / 100.0
-                            final_score = 0.7 * vec_score + 0.3 * lex_score
-                            item = ch.copy()
-                            item['final_score'] = final_score
-                            item['lex_score'] = lex_score
-                            item['base_query'] = base_q
-                            reranked.append(item)
-                        reranked.sort(key=lambda x: x['final_score'], reverse=True)
-                        top_context = reranked[:search_k]
 
                         with st.expander("🔎 Retrieval diagnostics (top matches)"):
                             for idx, it in enumerate(top_context, start=1):
@@ -309,15 +303,6 @@ def main():
                                     f"Matched query: {it.get('base_query', query)}"
                                 )
                                 st.write((it.get('text', '')[:300] + '...') if len(it.get('text', '')) > 300 else it.get('text', ''))
-
-                        # Step 3: Use reasoning agent for complex queries
-                        status_box.update(label="Analyzing with reasoning agent…", state="running")
-                        reasoning_context = {
-                            "query": query,
-                            "retrieved_chunks": top_context,
-                            "intent": qa_analysis.get("intent", "unknown")
-                        }
-                        reasoning_result = reasoning_agent.process_query(query, reasoning_context)
                         
                         # Step 4: Generate final answer with reasoning
                         status_box.update(label="Generating answer…", state="running")
@@ -329,10 +314,14 @@ def main():
                                 answer += "\n\n**Reasoning Steps:**\n"
                                 for i, step in enumerate(reasoning_steps, 1):
                                     answer += f"{i}. {step}\n"
-                            result = {"answer": answer, "sources": [chunk.get('source', '') for chunk in top_context]}
+                            # Annotate with context count
+                            header = f"(Relevant context found: {len(top_context)} chunks)\n\n"
+                            result = {"answer": header + answer, "sources": [chunk.get('source', '') for chunk in top_context]}
                         else:
                             # Fall back to simple QA for straightforward questions
-                            result = llm_client.answer_question(query, top_context)
+                            base = llm_client.answer_question(query, top_context)
+                            header = f"(Relevant context found: {len(top_context)} chunks)\n\n"
+                            result = {"answer": header + base.get("answer", ""), "sources": base.get("sources", [])}
 
                         # Done
                         status_box.update(label="Done ✅", state="complete")
@@ -384,7 +373,22 @@ def main():
         
         if st.session_state.pdf_processed:
             # Show document statistics
-            stats = vector_store.get_index_stats()
+            # Lightweight cache for index stats to avoid frequent network calls
+            def get_index_stats_cached():
+                import time
+                now = time.time()
+                cache_key = "_cached_index_stats"
+                ts_key = "_cached_index_stats_ts"
+                ttl = 5.0  # seconds
+                if cache_key in st.session_state and ts_key in st.session_state:
+                    if now - st.session_state[ts_key] < ttl:
+                        return st.session_state[cache_key]
+                stats_local = vector_store.get_index_stats()
+                st.session_state[cache_key] = stats_local
+                st.session_state[ts_key] = now
+                return stats_local
+
+            stats = get_index_stats_cached()
             
             st.markdown('<div class="info-box">', unsafe_allow_html=True)
             st.markdown("**Document Status:** ✅ Processed")

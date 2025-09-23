@@ -12,9 +12,10 @@ class ReasoningPlannerAgent:
     4. Generate structured reasoning chains
     """
 
-    def __init__(self, gemini_api_key: str, model_name: str = "gemini-1.5-flash"):
+    def __init__(self, gemini_api_key: str, model_name: str = "gemini-1.5-flash", retriever_agent: Any = None):
         self.gemini_api_key = gemini_api_key
         self.model_name = model_name
+        self.retriever_agent = retriever_agent
         self._model = None
         self._graph = None
         self._initialize_llm()
@@ -66,9 +67,34 @@ class ReasoningPlannerAgent:
         return state
 
     def _execute_retrieval_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """Simulate or execute the retrieval plan."""
-        # In a real implementation, this would interact with the vector store
-        # For now, we'll just pass through the state
+        """Execute the retrieval plan using the provided RetrieverAgent if available."""
+        # Ensure context container exists
+        if "context" not in state or state["context"] is None:
+            state["context"] = {}
+
+        # If no retriever wired, pass through
+        if not getattr(self, "retriever_agent", None):
+            return state
+
+        # Determine what to retrieve
+        ctx = state.get("context", {})
+        questions_for_retrieval: List[str] = ctx.get("sub_questions") or state.get("retrieval_plan") or [state.get("query", "")]
+        document_id: Optional[str] = ctx.get("document_id")
+        top_k: int = int(ctx.get("top_k") or 5)
+        base_query: str = state.get("query", "")
+
+        try:
+            top_context = self.retriever_agent.retrieve(
+                questions=questions_for_retrieval,
+                top_k=top_k,
+                document_id=document_id,
+                base_query=base_query,
+            )
+            # Store retrieved chunks back into context for downstream nodes / UI
+            state["context"]["retrieved_chunks"] = top_context
+        except Exception as e:
+            # On failure, keep existing state and proceed
+            state["context"]["retrieved_chunks"] = []
         return state
 
     def _reasoning_node(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,6 +102,10 @@ class ReasoningPlannerAgent:
         if not state["reasoning_required"]:
             return state
             
+        # Honor force_reasoning flag from context (if present)
+        if state.get("context", {}).get("force_reasoning"):
+            state["reasoning_required"] = True
+
         prompt = """
         Based on the following query and context, generate a well-reasoned answer.
         

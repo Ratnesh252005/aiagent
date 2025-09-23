@@ -1,3 +1,9 @@
+### Planner-Driven Retrieval (LangGraph)
+
+- The `ReasoningPlannerAgent` executes retrieval via the `RetrieverAgent` using the sub-questions or its own retrieval plan
+- Retrieved chunks are stored in the planner's context and displayed in the UI diagnostics
+- A "Force reasoning mode" toggle in Settings can be enabled to consistently show reasoning chains during testing
+
 # 📚 RAG Document Assistant
 
 A powerful Retrieval Augmented Generation (RAG) system that allows users to upload PDF documents and ask intelligent questions about their content using state-of-the-art AI technologies.
@@ -12,7 +18,11 @@ A powerful Retrieval Augmented Generation (RAG) system that allows users to uplo
 - **🗄️ Vector Storage**: Pinecone vector database for efficient similarity search
 - **🤖 AI Responses**: Google Gemini 1.5 Flash API for fast, cost-effective answer generation
 - **🧭 Query Understanding Agent (LangGraph)**: Classifies intent (Explain/Quiz/Summary) and optionally decomposes complex questions into sub-questions
+- **📥 Retriever Agent**: Dedicated agent that performs batched sub-question embeddings, vector search, de-duplication, and hybrid re-ranking
+- **🧠 Planner executes retrieval (LangGraph)**: The Reasoning/Planner Agent now calls the Retriever Agent internally and reasons over the retrieved context
 - **🧪 Hybrid Re-ranking**: Combines vector similarity with lexical matching (RapidFuzz) for better retrieval precision
+- **🧷 Force reasoning toggle**: UI toggle to force multi-step reasoning for testing
+- **🧾 Explicit context reporting**: Every answer annotates whether relevant context was found; if not, the chat records "No relevant context was found"
 - **📂 Document Management**: Sidebar document selector and one-click delete of a selected document
 - **💬 Interactive UI**: Beautiful Streamlit web interface with chat history
 - **📈 Analytics**: Document statistics and source attribution

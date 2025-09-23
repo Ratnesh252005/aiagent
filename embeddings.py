@@ -1,6 +1,7 @@
 from sentence_transformers import SentenceTransformer
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+import os
 import streamlit as st
 
 class EmbeddingGenerator:
@@ -17,21 +18,31 @@ class EmbeddingGenerator:
         self.model_name = model_name
         self.model = None
         self.embedding_dimension = None
+        # Performance knobs via env
+        self.device = os.getenv("EMBEDDING_DEVICE", "cpu")  # e.g., "cuda" if available
+        try:
+            self.batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+        except Exception:
+            self.batch_size = 64
         
     @st.cache_resource
     def load_model(_self):
         """Load the sentence transformer model (cached for performance)"""
         try:
-            with st.spinner(f"Loading embedding model: {_self.model_name}..."):
-                model = SentenceTransformer(_self.model_name)
-                
-                # Get embedding dimension
-                test_embedding = model.encode(["test"])
-                embedding_dim = test_embedding.shape[1]
-                
+            with st.spinner(f"Loading embedding model: {_self.model_name} ({_self.device})..."):
+                model = SentenceTransformer(_self.model_name, device=_self.device)
+                # Use built-in method to get dimension (avoids extra forward pass)
+                try:
+                    embedding_dim = int(getattr(model, "get_sentence_embedding_dimension", lambda: 0)())
+                    if not embedding_dim:
+                        # Fallback (single quick encode) if method unavailable
+                        test_embedding = model.encode(["t"], convert_to_numpy=True)
+                        embedding_dim = test_embedding.shape[1]
+                except Exception:
+                    test_embedding = model.encode(["t"], convert_to_numpy=True)
+                    embedding_dim = test_embedding.shape[1]
                 st.success(f"✅ Loaded embedding model with {embedding_dim} dimensions")
                 return model, embedding_dim
-                
         except Exception as e:
             st.error(f"Error loading embedding model: {str(e)}")
             return None, None
@@ -59,28 +70,27 @@ class EmbeddingGenerator:
             return []
         
         try:
-            # Create progress tracking
+            # Fast path for small N: no UI, single call
+            if len(texts) <= 8:
+                arr = model.encode(texts, convert_to_numpy=True, batch_size=self.batch_size)
+                return list(arr)
+
+            # UI path for larger batches
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            embeddings = []
-            batch_size = 32  # Process in batches for better performance
-            
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                
-                # Generate embeddings for batch
-                batch_embeddings = model.encode(batch, convert_to_numpy=True)
+
+            embeddings: List[np.ndarray] = []
+            for i in range(0, len(texts), self.batch_size):
+                batch = texts[i:i + self.batch_size]
+                batch_embeddings = model.encode(batch, convert_to_numpy=True, batch_size=self.batch_size)
                 embeddings.extend(batch_embeddings)
-                
-                # Update progress
-                progress = min(1.0, (i + batch_size) / len(texts))
+                progress = min(1.0, (i + self.batch_size) / len(texts))
                 progress_bar.progress(progress)
-                status_text.text(f"Generating embeddings: {min(i + batch_size, len(texts))}/{len(texts)}")
-            
+                status_text.text(f"Generating embeddings: {min(i + self.batch_size, len(texts))}/{len(texts)}")
+
             progress_bar.empty()
             status_text.empty()
-            
+
             return embeddings
             
         except Exception as e:
@@ -104,7 +114,7 @@ class EmbeddingGenerator:
             return np.array([])
         
         try:
-            embedding = model.encode([text], convert_to_numpy=True)[0]
+            embedding = model.encode([text], convert_to_numpy=True, batch_size=1)[0]
             return embedding
             
         except Exception as e:
@@ -149,3 +159,17 @@ class EmbeddingGenerator:
         st.success(f"✅ Generated embeddings for {len(embedded_chunks)} chunks")
         
         return embedded_chunks
+
+    # --- Performance: quiet batch embedding without Streamlit UI (for agents) ---
+    def generate_embeddings_quiet(self, texts: List[str]) -> List[np.ndarray]:
+        """Batch embedding without Streamlit progress to minimize overhead for small agent calls."""
+        if not texts:
+            return []
+        model, _ = self.get_model()
+        if model is None:
+            return []
+        try:
+            arr = model.encode(texts, convert_to_numpy=True, batch_size=self.batch_size)
+            return list(arr)
+        except Exception:
+            return []
