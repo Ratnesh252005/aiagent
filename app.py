@@ -6,6 +6,7 @@ from embeddings import EmbeddingGenerator
 from vector_store import PineconeVectorStore
 from llm_client import GeminiLLMClient
 from agents.query_understanding import QueryUnderstandingAgent
+from agents.reasoning_planner import ReasoningPlannerAgent
 import uuid
 from rapidfuzz import fuzz
 
@@ -89,6 +90,7 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
     vector_store = PineconeVectorStore(pinecone_key, pinecone_env)
     llm_client = GeminiLLMClient(gemini_key)
     query_agent = QueryUnderstandingAgent(gemini_key, model_name="gemini-1.5-flash")
+    reasoning_agent = ReasoningPlannerAgent(gemini_key, model_name="gemini-1.5-flash")
     
     # Test connections
     connections_ok = True
@@ -107,7 +109,15 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
         if not vector_store.create_index(embedding_dim):
             connections_ok = False
     
-    return pdf_processor, embedding_generator, vector_store, llm_client, query_agent, connections_ok
+    return {
+        'pdf_processor': pdf_processor,
+        'embedding_generator': embedding_generator,
+        'vector_store': vector_store,
+        'llm_client': llm_client,
+        'query_agent': query_agent,
+        'reasoning_agent': reasoning_agent,
+        'connections_ok': connections_ok
+    }
 
 def main():
     """Main application function"""
@@ -129,9 +139,14 @@ def main():
     
     # Initialize components
     with st.spinner("Initializing RAG components..."):
-        pdf_processor, embedding_generator, vector_store, llm_client, query_agent, connections_ok = initialize_components(
-            pinecone_key, pinecone_env, gemini_key
-        )
+        components = initialize_components(pinecone_key, pinecone_env, gemini_key)
+        pdf_processor = components['pdf_processor']
+        embedding_generator = components['embedding_generator']
+        vector_store = components['vector_store']
+        llm_client = components['llm_client']
+        query_agent = components['query_agent']
+        reasoning_agent = components['reasoning_agent']
+        connections_ok = components['connections_ok']
     
     if not connections_ok:
         st.error("Failed to initialize one or more components. Please check your API keys and try again.")
@@ -295,19 +310,42 @@ def main():
                                 )
                                 st.write((it.get('text', '')[:300] + '...') if len(it.get('text', '')) > 300 else it.get('text', ''))
 
-                        # Step 3: Generating answer
+                        # Step 3: Use reasoning agent for complex queries
+                        status_box.update(label="Analyzing with reasoning agent…", state="running")
+                        reasoning_context = {
+                            "query": query,
+                            "retrieved_chunks": top_context,
+                            "intent": qa_analysis.get("intent", "unknown")
+                        }
+                        reasoning_result = reasoning_agent.process_query(query, reasoning_context)
+                        
+                        # Step 4: Generate final answer with reasoning
                         status_box.update(label="Generating answer…", state="running")
-                        result = llm_client.answer_question(query, top_context)
+                        if reasoning_result.get("reasoning_required", False):
+                            # Use the reasoning chain if available
+                            answer = reasoning_result.get("final_answer", "")
+                            reasoning_steps = reasoning_result.get("reasoning_chain", [])
+                            if reasoning_steps:
+                                answer += "\n\n**Reasoning Steps:**\n"
+                                for i, step in enumerate(reasoning_steps, 1):
+                                    answer += f"{i}. {step}\n"
+                            result = {"answer": answer, "sources": [chunk.get('source', '') for chunk in top_context]}
+                        else:
+                            # Fall back to simple QA for straightforward questions
+                            result = llm_client.answer_question(query, top_context)
 
                         # Done
                         status_box.update(label="Done ✅", state="complete")
 
-                        # Add to chat history
-                        st.session_state.chat_history.append({
+                        # Add to chat history with reasoning information
+                        chat_entry = {
                             "query": query,
                             "answer": result["answer"],
-                            "sources": result["sources"]
-                        })
+                            "sources": result["sources"],
+                            "reasoning_required": reasoning_result.get("reasoning_required", False),
+                            "reasoning_chain": reasoning_result.get("reasoning_chain", [])
+                        }
+                        st.session_state.chat_history.append(chat_entry)
                         st.rerun()
                     except Exception as e:
                         status_box.update(label=f"Error: {e}", state="error")
@@ -319,13 +357,27 @@ def main():
                 for i, chat in enumerate(reversed(st.session_state.chat_history)):
                     with st.expander(f"Q: {chat['query'][:100]}...", expanded=(i == 0)):
                         st.markdown(f"**Question:** {chat['query']}")
-                        st.markdown(f"**Answer:** {chat['answer']}")
                         
+                        # Show reasoning chain in a separate expander
+                        if chat.get('reasoning_required') and chat.get('reasoning_chain'):
+                            with st.expander("💬 View Reasoning Process", expanded=True):
+                                st.markdown("### 💬 Multi-step Reasoning")
+                                st.markdown("The system used the following reasoning steps to answer your question:")
+                                for j, step in enumerate(chat['reasoning_chain'], 1):
+                                    st.markdown(f"**Step {j}:** {step}")
+                                st.markdown("---")
+                        
+                        # Show the final answer in a clean format
+                        st.markdown("### 💬 Final Answer")
+                        st.markdown(chat['answer'])
+                        
+                        # Show sources if available
                         if chat.get('sources'):
-                            st.markdown("**Sources:**")
-                            for j, source in enumerate(chat['sources'][:3]):  # Show top 3 sources
-                                st.markdown(f"- Chunk {source['chunk_number']} (Score: {source['score']:.3f})")
-                                st.markdown(f"  *{source['preview']}*")
+                            with st.expander("📝 View Sources", expanded=False):
+                                st.markdown("**Sources used in this response:**")
+                                for source in chat['sources']:
+                                    if source:  # Only show non-empty sources
+                                        st.markdown(f"- {source}")
     
     with col2:
         st.markdown('<h2 class="section-header">📊 Document Info</h2>', unsafe_allow_html=True)
