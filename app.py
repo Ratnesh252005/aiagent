@@ -8,8 +8,9 @@ from llm_client import GeminiLLMClient
 from agents.query_understanding import QueryUnderstandingAgent
 from agents.reasoning_planner import ReasoningPlannerAgent
 from agents.retriever import RetrieverAgent
+from agents.teaching_mode import TeachingModeAgent
+from agents.feedback_reflection import FeedbackReflectionAgent
 import uuid
-from rapidfuzz import fuzz
 
 # Load environment variables
 load_dotenv()
@@ -66,6 +67,10 @@ def initialize_session_state():
         st.session_state.chat_history = []
     if 'documents' not in st.session_state:
         st.session_state.documents = []
+    if '_auto_ask_once' not in st.session_state:
+        st.session_state._auto_ask_once = False
+    if 'pending_query' not in st.session_state:
+        st.session_state.pending_query = ""
 
 def check_api_keys():
     """Check if all required API keys are available"""
@@ -93,17 +98,11 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
     query_agent = QueryUnderstandingAgent(gemini_key, model_name="gemini-1.5-flash")
     retriever_agent = RetrieverAgent(embedding_generator, vector_store)
     reasoning_agent = ReasoningPlannerAgent(gemini_key, model_name="gemini-1.5-flash", retriever_agent=retriever_agent)
+    teaching_agent = TeachingModeAgent(gemini_key, model_name="gemini-1.5-flash")
+    feedback_agent = FeedbackReflectionAgent(gemini_key, model_name="gemini-1.5-flash")
     
-    # Test connections
+    # Defer all external service connections to first use for faster startup
     connections_ok = True
-    
-    # Initialize Pinecone
-    if not vector_store.initialize_pinecone():
-        connections_ok = False
-    
-    # Initialize Gemini
-    if not llm_client.initialize_gemini():
-        connections_ok = False
     
     return {
         'pdf_processor': pdf_processor,
@@ -113,6 +112,8 @@ def initialize_components(pinecone_key, pinecone_env, gemini_key):
         'query_agent': query_agent,
         'reasoning_agent': reasoning_agent,
         'retriever_agent': retriever_agent,
+        'teaching_agent': teaching_agent,
+        'feedback_agent': feedback_agent,
         'connections_ok': connections_ok
     }
 
@@ -144,6 +145,8 @@ def main():
         query_agent = components['query_agent']
         reasoning_agent = components['reasoning_agent']
         retriever_agent = components['retriever_agent']
+        teaching_agent = components['teaching_agent']
+        feedback_agent = components['feedback_agent']
         connections_ok = components['connections_ok']
     
     if not connections_ok:
@@ -226,6 +229,11 @@ def main():
         
         search_k = st.slider("Number of relevant chunks to retrieve", 1, 10, 5)
         force_reasoning = st.toggle("Force reasoning mode", value=False, help="For testing: always trigger reasoning chain display.")
+        teaching_mode_override = st.selectbox(
+            "Teaching mode presentation",
+            ["Auto", "Explain", "Quiz", "Summary"],
+            help="Force how the answer is presented. Auto uses the Query Understanding Agent's intent."
+        )
         
         if st.button("Clear Chat History"):
             st.session_state.chat_history = []
@@ -240,6 +248,11 @@ def main():
         if not st.session_state.pdf_processed:
             st.info("Please upload and process a PDF document first.")
         else:
+            # Preload pending query BEFORE creating the widget
+            if st.session_state.get('pending_query'):
+                st.session_state['query_input'] = st.session_state['pending_query']
+                st.session_state['pending_query'] = ""
+
             # Query input
             query = st.text_input(
                 "Ask a question about your document:",
@@ -247,7 +260,11 @@ def main():
                 key="query_input"
             )
             
-            if st.button("Get Answer", type="primary") and query:
+            auto_trigger = bool(st.session_state.get('_auto_ask_once')) and bool(query)
+            if (st.button("Get Answer", type="primary") and query) or auto_trigger:
+                # reset auto trigger immediately to avoid loops
+                if st.session_state.get('_auto_ask_once'):
+                    st.session_state._auto_ask_once = False
                 if st.session_state.current_document_id:
                     status_box = st.status("Processing query...", state="running", expanded=True)
                     try:
@@ -323,16 +340,75 @@ def main():
                             header = f"(Relevant context found: {len(top_context)} chunks)\n\n"
                             result = {"answer": header + base.get("answer", ""), "sources": base.get("sources", [])}
 
+                        # Step 5: Teaching Mode presentation (explain/quiz/summary, with mixed support)
+                        ql = (query or "").lower()
+                        wants_explain = ("reason" in ql or "why" in ql)
+                        wants_quiz = ("quiz" in ql)
+                        # Determine teaching mode (override if set)
+                        mode = (qa_analysis.get("intent") or "explain").lower()
+                        if teaching_mode_override and teaching_mode_override.lower() != "auto":
+                            mode = teaching_mode_override.lower()
+                            # If override is explicit, do not mix
+                            wants_explain = (mode == 'explain')
+                            wants_quiz = (mode == 'quiz')
+
+                        final_presentation = result["answer"]
+                        quiz_items = []
+                        summary_points = []
+                        mixed_mode = False
+                        if wants_explain and wants_quiz and (not teaching_mode_override or teaching_mode_override.lower() == 'auto'):
+                            # Mixed: explanation first
+                            p_explain = teaching_agent.present_answer(
+                                query=query,
+                                base_answer=result["answer"],
+                                mode='explain',
+                                context_chunks=top_context,
+                            )
+                            p_quiz = teaching_agent.present_answer(
+                                query=query,
+                                base_answer=result["answer"],
+                                mode='quiz',
+                                context_chunks=top_context,
+                            )
+                            final_presentation = (p_explain.get('final_presentation') or result['answer'])
+                            quiz_items = p_quiz.get('quiz_items', [])
+                            mixed_mode = True
+                        else:
+                            presentation = teaching_agent.present_answer(
+                                query=query,
+                                base_answer=result["answer"],
+                                mode=mode,
+                                context_chunks=top_context,
+                            )
+                            final_presentation = presentation.get("final_presentation", result["answer"])  # fallback
+                            quiz_items = presentation.get("quiz_items", [])
+                            summary_points = presentation.get("summary_points", [])
+
+                        # Step 6: Feedback & Reflection
+                        feedback = feedback_agent.evaluate_and_follow_up(
+                            query=query,
+                            presented_answer=final_presentation,
+                            context_chunks=top_context,
+                        )
+                        evaluation_text = feedback.get("evaluation")
+                        follow_up_q = feedback.get("follow_up")
+
                         # Done
                         status_box.update(label="Done ✅", state="complete")
 
                         # Add to chat history with reasoning information
+                        teaching_mode_label = 'explain+quiz' if mixed_mode else mode
                         chat_entry = {
                             "query": query,
-                            "answer": result["answer"],
+                            "answer": final_presentation,
                             "sources": result["sources"],
                             "reasoning_required": reasoning_result.get("reasoning_required", False),
-                            "reasoning_chain": reasoning_result.get("reasoning_chain", [])
+                            "reasoning_chain": reasoning_result.get("reasoning_chain", []),
+                            "teaching_mode": teaching_mode_label,
+                            "quiz_items": quiz_items,
+                            "summary_points": summary_points,
+                            "evaluation": evaluation_text,
+                            "follow_up": follow_up_q,
                         }
                         st.session_state.chat_history.append(chat_entry)
                         st.rerun()
@@ -359,6 +435,26 @@ def main():
                         # Show the final answer in a clean format
                         st.markdown("### 💬 Final Answer")
                         st.markdown(chat['answer'])
+
+                        # Mode-specific rendering
+                        mode = chat.get('teaching_mode', 'explain')
+                        st.markdown(f"**Teaching Mode:** `{mode}`")
+                        if mode == 'quiz' and chat.get('quiz_items'):
+                            with st.expander("📝 Practice Quiz", expanded=True):
+                                for qi_idx, qi in enumerate(chat['quiz_items'], 1):
+                                    q = qi.get('question')
+                                    opts = qi.get('options') or []
+                                    ans = qi.get('answer')
+                                    st.markdown(f"**Q{qi_idx}.** {q}")
+                                    if isinstance(opts, list) and opts:
+                                        for opt in opts:
+                                            st.markdown(f"- {opt}")
+                                    if ans:
+                                        st.markdown(f"<div class='success-box'><b>Answer:</b> {ans}</div>", unsafe_allow_html=True)
+                        elif mode == 'summary' and chat.get('summary_points'):
+                            with st.expander("🧾 5-line Summary", expanded=True):
+                                for pt in chat['summary_points']:
+                                    st.markdown(f"- {pt}")
                         
                         # Show sources if available
                         if chat.get('sources'):
@@ -367,6 +463,21 @@ def main():
                                 for source in chat['sources']:
                                     if source:  # Only show non-empty sources
                                         st.markdown(f"- {source}")
+
+                        # Feedback & Reflection
+                        if chat.get('evaluation') or chat.get('follow_up'):
+                            with st.expander("🔄 Feedback & Reflection", expanded=True):
+                                if chat.get('evaluation'):
+                                    st.markdown("**Evaluation:**")
+                                    st.info(chat['evaluation'])
+                                if chat.get('follow_up'):
+                                    st.markdown("**Follow-up question:**")
+                                    st.success(chat['follow_up'])
+                                    # Quick action to ask the suggested follow-up
+                                    if st.button("Ask this follow-up", key=f"ask_follow_{i}"):
+                                        st.session_state.pending_query = chat['follow_up']
+                                        st.session_state._auto_ask_once = True
+                                        st.rerun()
     
     with col2:
         st.markdown('<h2 class="section-header">📊 Document Info</h2>', unsafe_allow_html=True)
@@ -420,6 +531,15 @@ def main():
         - The system will show which parts of the document were used
         - Adjust the number of chunks to retrieve in settings
         """)
+
+    # Secondary input for next questions (always available)
+    st.markdown('---')
+    st.markdown('<h2 class="section-header">➕ Ask Another Question</h2>', unsafe_allow_html=True)
+    next_q = st.text_input("Your next question:", key="next_query_input", placeholder="Type a follow-up or a new question…")
+    if st.button("Ask Next", key="ask_next_btn") and next_q:
+        st.session_state.pending_query = next_q
+        st.session_state._auto_ask_once = True
+        st.rerun()
 
 if __name__ == "__main__":
     main()

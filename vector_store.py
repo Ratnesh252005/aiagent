@@ -39,9 +39,13 @@ class PineconeVectorStore:
         """Ensure self.index is connected; attempt lazy connection if possible."""
         if self.index is not None:
             return True
+        # Lazy init client if needed to avoid startup latency
         if self.pc is None:
-            st.error("Pinecone client not initialized. Please check API key and restart.")
-            return False
+            try:
+                self.pc = Pinecone(api_key=self.api_key)
+            except Exception as e:
+                st.error(f"Pinecone client init failed: {e}")
+                return False
         try:
             # Try to connect to existing index without creating
             self.index = self.pc.Index(self.index_name)
@@ -59,6 +63,13 @@ class PineconeVectorStore:
             metric: Distance metric (cosine, euclidean, dotproduct)
         """
         try:
+            # Ensure client exists (lazy init)
+            if self.pc is None:
+                try:
+                    self.pc = Pinecone(api_key=self.api_key)
+                except Exception as e:
+                    st.error(f"Error initializing Pinecone client: {e}")
+                    return False
             # Check if index exists
             existing_indexes = [index.name for index in self.pc.list_indexes()]
             

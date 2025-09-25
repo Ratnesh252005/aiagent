@@ -18,12 +18,19 @@ class QueryUnderstandingAgent:
         self.model_name = model_name
         self._model = None
         self._graph = None
-        self._initialize_llm()
         self._build_graph()
 
     def _initialize_llm(self):
         genai.configure(api_key=self.gemini_api_key)
         self._model = genai.GenerativeModel(self.model_name)
+    
+    def _ensure_model(self):
+        if self._model is None:
+            try:
+                genai.configure(api_key=self.gemini_api_key)
+                self._model = genai.GenerativeModel(self.model_name)
+            except Exception:
+                self._model = None
 
     # ----- Graph state -----
     def _initial_state(self, question: str) -> Dict[str, Any]:
@@ -47,11 +54,14 @@ class QueryUnderstandingAgent:
         Respond ONLY with JSON.
         """
         # Retry with simple exponential backoff to handle rate limits
+        self._ensure_model()
         data = None
         last_err = None
         for attempt in range(3):
             try:
-                resp = self._model.generate_content(prompt)
+                resp = self._model.generate_content(prompt) if self._model else None
+                if resp is None:
+                    raise RuntimeError("Model not available")
                 text = resp.text or "{}"
                 # try to extract JSON from code block if present
                 text = text.strip()
@@ -77,7 +87,13 @@ class QueryUnderstandingAgent:
             # fallback minimal
             data = {"intent": "explain", "confidence": 0.5, "sub_questions": []}
 
-        state["intent"] = data.get("intent", "explain")
+        # Coerce intent to a string
+        intent_val = data.get("intent", "explain")
+        if isinstance(intent_val, list):
+            intent_val = next((s for s in intent_val if isinstance(s, str) and s.strip()), "explain")
+        if not isinstance(intent_val, str):
+            intent_val = "explain"
+        state["intent"] = intent_val
         state["confidence"] = data.get("confidence", 0.5)
         subs = data.get("sub_questions", []) or []
         if isinstance(subs, list):
@@ -98,8 +114,14 @@ class QueryUnderstandingAgent:
         """Run the LangGraph to analyze a question and return intent + sub-questions."""
         state = self._initial_state(question)
         out = self._graph.invoke(state)
+        # Normalize intent to a lowercase string for downstream logic
+        intent_val = out.get("intent", "explain")
+        if isinstance(intent_val, list):
+            intent_val = next((s for s in intent_val if isinstance(s, str) and s.strip()), "explain")
+        if not isinstance(intent_val, str):
+            intent_val = "explain"
         return {
-            "intent": out.get("intent", "explain"),
+            "intent": intent_val,
             "confidence": out.get("confidence", 0.5),
             "sub_questions": out.get("sub_questions", [])
         }

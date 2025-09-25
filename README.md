@@ -26,6 +26,9 @@ A powerful Retrieval Augmented Generation (RAG) system that allows users to uplo
 - **📂 Document Management**: Sidebar document selector and one-click delete of a selected document
 - **💬 Interactive UI**: Beautiful Streamlit web interface with chat history
 - **📈 Analytics**: Document statistics and source attribution
+- **🎤 Teaching Mode Agent (LangGraph)**: Chooses how to present responses: Explain, Quiz (with answer key), or Summary (5 lines)
+- **🔄 Feedback & Reflection Agent (LangGraph)**: Evaluates answer quality and suggests a follow-up question
+- **🧰 Teaching mode override**: Settings control to force presentation (Auto/Explain/Quiz/Summary)
 
 ## 📋 Prerequisites
 
@@ -232,6 +235,8 @@ Generating embeddings: 15/15
    - Retrieving context… (Hybrid retrieval + re-ranking)
    - Generating answer… (Gemini 1.5 Flash)
 4. **Get the answer** with cited chunks and diagnostics
+
+> Note: The answer is presented via the Teaching Mode Agent. By default, the mode is selected automatically from intent, but you can force it in Settings → "Teaching mode presentation" (Auto/Explain/Quiz/Summary).
 
 **Example Questions:**
 - "What is the main topic of this document?"

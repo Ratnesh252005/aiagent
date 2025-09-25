@@ -18,13 +18,20 @@ class ReasoningPlannerAgent:
         self.retriever_agent = retriever_agent
         self._model = None
         self._graph = None
-        self._initialize_llm()
         self._build_graph()
 
     def _initialize_llm(self):
         """Initialize the Gemini model with the provided API key."""
         genai.configure(api_key=self.gemini_api_key)
         self._model = genai.GenerativeModel(self.model_name)
+    
+    def _ensure_model(self):
+        if self._model is None:
+            try:
+                genai.configure(api_key=self.gemini_api_key)
+                self._model = genai.GenerativeModel(self.model_name)
+            except Exception:
+                self._model = None
 
     def _initial_state(self, query: str, context: Optional[Dict] = None) -> Dict[str, Any]:
         """Initialize the state for the reasoning graph."""
@@ -141,7 +148,10 @@ class ReasoningPlannerAgent:
     def _get_llm_response(self, prompt: str) -> Dict:
         """Get a response from the LLM and parse it as JSON."""
         try:
-            response = self._model.generate_content(prompt)
+            self._ensure_model()
+            response = self._model.generate_content(prompt) if self._model else None
+            if response is None:
+                raise RuntimeError("Model not available")
             text = response.text.strip()
             
             # Clean up the response if it's in a code block

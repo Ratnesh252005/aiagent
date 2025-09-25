@@ -30,6 +30,16 @@ class GeminiLLMClient:
             st.error(f"Error connecting to Gemini API: {str(e)}")
             return False
     
+    def ensure_model(self):
+        """Lazily initialize the Gemini model if not already initialized."""
+        if self.model is None:
+            try:
+                genai.configure(api_key=self.api_key)
+                self.model = genai.GenerativeModel(self.model_name)
+            except Exception:
+                return False
+        return True
+    
     def create_rag_prompt(self, query: str, context_chunks: List[Dict[str, Any]]) -> str:
         """
         Create a RAG prompt with query and retrieved context
@@ -80,8 +90,10 @@ ANSWER:"""
             Generated response text
         """
         if not self.model:
-            st.error("Gemini model not initialized")
-            return "Error: Gemini model not available"
+            ok = self.ensure_model()
+            if not ok:
+                st.error("Gemini model not initialized")
+                return "Error: Gemini model not available"
         
         for attempt in range(max_retries):
             try:
